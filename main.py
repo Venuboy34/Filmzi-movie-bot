@@ -7,7 +7,7 @@ import logging
 import difflib
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -105,6 +105,14 @@ def start_health_server():
     logger.info(f"Health check server running on port {PORT}")
     server.serve_forever()
 
+# Greeting based on time
+def get_greeting():
+    current_hour = datetime.now().hour
+    if 5 <= current_hour < 12: return "ɢᴏᴏᴅ ᴍᴏʀɴɪɴɢ 🌞"
+    elif 12 <= current_hour < 17: return "ɢᴏᴏᴅ ᴀғᴛᴇʀɴᴏᴏɴ ☀️"
+    elif 17 <= current_hour < 21: return "ɢᴏᴏᴅ ᴇᴠᴇɴɪɴɢ 🌅"
+    else: return "ɢᴏᴏᴅ ɴɪɢʜᴛ 🌙"
+
 # Media functions
 async def get_all_media() -> Tuple[List[Dict], List[str]]:
     global media_cache
@@ -194,12 +202,9 @@ def filter_media_by_query(all_media: List[Dict], query: str) -> List[Dict]:
     
     if not partial_matches:
         titles = [m.get('title', '').lower() for m in all_media]
-        matcher = difflib.SequenceMatcher()
-        matcher.set_seq2(query)
         for media in all_media:
             title = media.get('title', '').lower()
-            matcher.set_seq1(title)
-            if matcher.ratio() > 0.6:
+            if difflib.SequenceMatcher(None, query, title).ratio() > 0.6:
                 partial_matches.append(media)
     
     return partial_matches
@@ -445,7 +450,8 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.message.delete()
         await callback_query.answer()
     
-    # Other handlers...
+    # Simplified other handlers for brevity
+    # Add your other callback handlers here...
 
 # Keep alive function
 async def keep_alive():
@@ -453,14 +459,34 @@ async def keep_alive():
         logger.info("Keep alive ping")
         await asyncio.sleep(300)
 
-# Startup handler
-@app.on_startup()
-async def startup():
+# Main async function
+async def main():
+    # Start health server in separate thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
+    # Load statistics
     load_stats()
+    
+    # Start the bot
+    await app.start()
+    logger.info("Filmzi Bot is running...")
+    
+    # Start keep alive task
     asyncio.create_task(keep_alive())
-    threading.Thread(target=start_health_server, daemon=True).start()
+    
+    # Run until stopped
+    await idle()
+    
+    # Stop the bot
+    await app.stop()
 
 # Run the bot
 if __name__ == "__main__":
-    logger.info("Starting Filmzi Bot...")
-    app.run()
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
