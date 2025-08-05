@@ -5,7 +5,7 @@ import threading
 import json
 import logging
 import difflib
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -15,7 +15,7 @@ from pyrogram.types import (
     CallbackQuery,
 )
 import requests
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +42,11 @@ app = Client("Filmzi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 # User data cache (for pagination and state management)
 user_data = {}
 user_stats = {}
+media_cache = {
+    "last_updated": None,
+    "data": [],
+    "titles": []
+}
 
 # Load statistics
 def load_stats():
@@ -119,19 +124,37 @@ def start_health_server():
     server.serve_forever()
 
 # Helper functions
-async def get_all_media() -> Union[List[Dict], None]:
+async def get_all_media() -> Tuple[List[Dict], List[str]]:
+    """Get all media with caching mechanism"""
+    global media_cache
+    
+    # Return cached data if it's fresh (less than 5 minutes old)
+    if media_cache["data"] and media_cache["last_updated"]:
+        if datetime.now() - media_cache["last_updated"] < timedelta(minutes=5):
+            return media_cache["data"], media_cache["titles"]
+    
     try:
-        response = requests.get(f"{BASE_URL}{MEDIA_ENDPOINT}", timeout=10)
+        response = requests.get(f"{BASE_URL}{MEDIA_ENDPOINT}", timeout=15)
         if response.status_code == 200:
-            return response.json()
-        return None
+            all_media = response.json()
+            titles = [media.get('title', '').lower() for media in all_media]
+            
+            # Update cache
+            media_cache = {
+                "last_updated": datetime.now(),
+                "data": all_media,
+                "titles": titles
+            }
+            
+            return all_media, titles
+        return [], []
     except Exception as e:
         logger.error(f"Error getting all media: {e}")
-        return None
+        return [], []
 
 async def get_media_by_id(media_id: int) -> Union[Dict, None]:
     try:
-        response = requests.get(f"{BASE_URL}{MEDIA_ENDPOINT}/{media_id}", timeout=10)
+        response = requests.get(f"{BASE_URL}{MEDIA_ENDPOINT}/{media_id}", timeout=15)
         if response.status_code == 200:
             return response.json()
         return None
@@ -185,20 +208,40 @@ def create_episode_buttons(season_data: Dict, media_id: int, season_num: str) ->
 def filter_media_by_query(all_media: List[Dict], query: str) -> List[Dict]:
     query = query.lower().strip()
     if not query:
-        return all_media
+        return []
     
-    filtered = []
+    # First pass: exact match or substring
+    exact_matches = []
+    partial_matches = []
+    
     for media in all_media:
-        if query in media.get('title', '').lower():
-            filtered.append(media)
-        elif 'keywords' in media and any(query in kw.lower() for kw in media['keywords']):
-            filtered.append(media)
+        title = media.get('title', '').lower()
+        if query == title:
+            exact_matches.append(media)
+        elif query in title:
+            partial_matches.append(media)
     
-    return filtered
+    # If we have exact matches, return them
+    if exact_matches:
+        return exact_matches
+    
+    # Second pass: fuzzy matching
+    if not partial_matches:
+        titles = [media.get('title', '').lower() for media in all_media]
+        matcher = difflib.SequenceMatcher()
+        matcher.set_seq2(query)
+        
+        for media in all_media:
+            title = media.get('title', '').lower()
+            matcher.set_seq1(title)
+            if matcher.ratio() > 0.6:  # 60% similarity
+                partial_matches.append(media)
+    
+    return partial_matches
 
 def get_suggestions(query: str, all_titles: List[str]) -> List[str]:
     """Get spelling suggestions for search query"""
-    suggestions = difflib.get_close_matches(query, all_titles, n=3, cutoff=0.6)
+    suggestions = difflib.get_close_matches(query, all_titles, n=3, cutoff=0.5)
     return suggestions
 
 async def auto_delete_message(client: Client, chat_id: int, message_id: int, delay: int = 600):
@@ -212,8 +255,7 @@ async def auto_delete_message(client: Client, chat_id: int, message_id: int, del
 # New function to display search results in grid format
 async def display_search_results_grid(client: Client, user_id: int, results: List[Dict], chat_id: int, query: str):
     if not results:
-        all_media = await get_all_media()
-        all_titles = [media['title'].lower() for media in all_media]
+        all_media, all_titles = await get_all_media()
         suggestions = get_suggestions(query.lower(), all_titles)
         
         message_text = f"**❌ No results found for '{query}'**"
@@ -261,10 +303,9 @@ async def display_search_results_grid(client: Client, user_id: int, results: Lis
     
     buttons.append([InlineKeyboardButton("🔙 New Search", callback_data="back_to_start")])
     
-    # Try to send grid with poster if available
+    # Try to send grid with poster
+    poster_url = results[0].get("poster_url", "https://ar-hosting.pages.dev/1754324374997.jpg")
     try:
-        # Use first result's poster as grid header
-        poster_url = results[0].get("poster_url", "https://ar-hosting.pages.dev/1754324374997.jpg")
         await client.send_photo(
             chat_id=chat_id,
             photo=poster_url,
@@ -366,9 +407,9 @@ async def auto_filter(client: Client, message: Message):
     search_msg = await message.reply_text(f"🔍 Searching for '{query}'...")
     
     # Get all media and filter locally
-    all_media = await get_all_media()
-    if not all_media or not isinstance(all_media, list):
-        await search_msg.edit_text(f"**❌ No results found for '{query}'**")
+    all_media, all_titles = await get_all_media()
+    if not all_media:
+        await search_msg.edit_text("**❌ Failed to load media database. Please try again later.**")
         return
     
     results = filter_media_by_query(all_media, query)
@@ -429,41 +470,38 @@ async def display_result_page(client: Client, user_id: int, message_id: int, pag
     buttons.append([InlineKeyboardButton("🔙 Back to Results", callback_data="back_to_search")])
     
     # Try to include poster if available
+    poster_url = media.get("poster_url", "https://ar-hosting.pages.dev/1754324374997.jpg")
     try:
-        poster_url = media.get("poster_url")
-        if poster_url:
-            if chat_id:  # New message
-                await client.send_photo(
-                    chat_id=chat_id,
-                    photo=poster_url,
-                    caption=message_text,
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-            else:  # Edit existing message
-                await client.send_photo(
-                    chat_id=user_id,
-                    photo=poster_url,
-                    caption=message_text,
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-            return
+        if chat_id:  # New message
+            await client.send_photo(
+                chat_id=chat_id,
+                photo=poster_url,
+                caption=message_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:  # Edit existing message
+            await client.send_photo(
+                chat_id=user_id,
+                photo=poster_url,
+                caption=message_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
     except Exception as e:
         logger.error(f"Error sending photo: {e}")
-    
-    # Fallback to text message if photo fails
-    if message_id and not chat_id:
-        await client.edit_message_text(
-            chat_id=user_id,
-            message_id=message_id,
-            text=message_text,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-    else:
-        await client.send_message(
-            chat_id=chat_id or user_id,
-            text=message_text,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        # Fallback to text message
+        if message_id and not chat_id:
+            await client.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=message_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            await client.send_message(
+                chat_id=chat_id or user_id,
+                text=message_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
 
 # Callback query handlers
 @app.on_callback_query()
@@ -501,25 +539,21 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
         buttons.append([InlineKeyboardButton("🔙 Back to Results", callback_data="back_to_search")])
         
         # Try to include poster
+        poster_url = media.get("poster_url", "https://ar-hosting.pages.dev/1754324374997.jpg")
         try:
-            poster_url = media.get("poster_url")
-            if poster_url:
-                await callback_query.message.reply_photo(
-                    photo=poster_url,
-                    caption=message_text,
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-                await callback_query.message.delete()
-                await callback_query.answer()
-                return
+            await callback_query.message.reply_photo(
+                photo=poster_url,
+                caption=message_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            await callback_query.message.delete()
         except Exception as e:
             logger.error(f"Error sending photo: {e}")
-        
-        # Fallback to text
-        await callback_query.edit_message_text(
-            message_text,
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+            # Fallback to text
+            await callback_query.edit_message_text(
+                message_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
         await callback_query.answer()
     
     elif data.startswith("quality_"):
@@ -537,58 +571,139 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("❌ Download link not available", show_alert=True)
             return
         
-        # Send video file directly
-        try:
-            # Try to send as document first
-            sent_msg = await client.send_document(
-                chat_id=callback_query.from_user.id,
-                document=video_url,
-                caption=f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"
-                        f"**📁 Size:** {media.get('size', 'N/A')}\n"
-                        f"**🎥 Quality:** {quality.upper()}\n\n"
-                        "**⚠️ This file will be deleted in 10 minutes**\n\n"
-                        "**Created By:** [Zero Creations](https://t.me/zerocreations)",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],
-                    [InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}")]
-                ])
-            )
-            
-            # Auto delete after 10 minutes
-            asyncio.create_task(auto_delete_message(
-                client, 
-                callback_query.from_user.id, 
-                sent_msg.id
-            ))
-            
-        except Exception as e:
-            logger.error(f"Error sending document: {e}")
-            # Fallback to download link message
-            message_text = (
-                f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"
-                f"**📁 Size:** {media.get('size', 'N/A')}\n"
-                f"**🎥 Quality:** {quality.upper()}\n\n"
-                "**⚠️ LINK EXPIRES IN 10 MINUTES**\n\n"
-                "**Created By:** [Zero Creations](https://t.me/zerocreations)"
-            )
-            
-            buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],
-                [InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}"),
-                 InlineKeyboardButton("🔙 Back", callback_data=f"back_to_quality_{media_id}")]
-            ])
-            
-            await callback_query.edit_message_text(
-                message_text,
-                reply_markup=buttons
-            )
-            
-            # Auto delete after 10 minutes
-            asyncio.create_task(auto_delete_message(
-                client, 
-                callback_query.message.chat.id, 
-                callback_query.message.id
-            ))
+        # Send download link message
+        message_text = (
+            f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"
+            f"**📁 Size:** {media.get('size', 'N/A')}\n"
+            f"**🎥 Quality:** {quality.upper()}\n\n"
+            "**⚠️ LINK EXPIRES IN 10 MINUTES**\n\n"
+            "**Created By:** [Zero Creations](https://t.me/zerocreations)"
+        )
+        
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],
+            [InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}"),
+             InlineKeyboardButton("🔙 Back", callback_data=f"back_to_quality_{media_id}")]
+        ])
+        
+        await callback_query.edit_message_text(
+            message_text,
+            reply_markup=buttons
+        )
+        
+        # Auto delete after 10 minutes
+        asyncio.create_task(auto_delete_message(
+            client, 
+            callback_query.message.chat.id, 
+            callback_query.message.id
+        ))
+        
+        await callback_query.answer()
+    
+    elif data.startswith("season_"):
+        season_num = data.split("_")[1]
+        media_id = int(data.split("_")[2])
+        media = await get_media_by_id(media_id)
+        
+        if not media or "seasons" not in media:
+            await callback_query.answer("❌ Season data not available", show_alert=True)
+            return
+        
+        season_key = f"season_{season_num}"
+        if season_key not in media["seasons"]:
+            await callback_query.answer("❌ Season not available", show_alert=True)
+            return
+        
+        season_data = media["seasons"][season_key]
+        keyboard = create_episode_buttons(season_data, media_id, season_num)
+        
+        await callback_query.edit_message_text(
+            f"**📺 {media['title']} - Season {season_num}**\n\n"
+            "**Select an episode:**",
+            reply_markup=keyboard
+        )
+        await callback_query.answer()
+    
+    elif data.startswith("episode_"):
+        parts = data.split("_")
+        season_num = parts[1]
+        episode_num = parts[2]
+        media_id = int(parts[3])
+        media = await get_media_by_id(media_id)
+        track_user(user_id, "download")
+        
+        if not media or "seasons" not in media:
+            await callback_query.answer("❌ Episode not available", show_alert=True)
+            return
+        
+        season_key = f"season_{season_num}"
+        if season_key not in media["seasons"]:
+            await callback_query.answer("❌ Episode not available", show_alert=True)
+            return
+        
+        episode = next(
+            (ep for ep in media["seasons"][season_key]["episodes"] 
+            if str(ep["episode_number"]) == episode_num),
+            None
+        )
+        
+        if not episode:
+            await callback_query.answer("❌ Episode not found", show_alert=True)
+            return
+        
+        # Auto select best available quality
+        video_url = None
+        quality = None
+        
+        # Check for available qualities (priority: 720p > 480p > 360p)
+        if "video_720p" in episode and episode["video_720p"]:
+            video_url = episode["video_720p"]
+            quality = "720p"
+        elif "video_480p" in episode and episode["video_480p"]:
+            video_url = episode["video_480p"]
+            quality = "480p"
+        elif "video_360p" in episode and episode["video_360p"]:
+            video_url = episode["video_360p"]
+            quality = "360p"
+        elif "video_links" in episode and episode["video_links"]:
+            # If video_links is available, get the first available quality
+            for q in ["720p", "480p", "360p"]:
+                if q in episode["video_links"] and episode["video_links"][q]:
+                    video_url = episode["video_links"][q]
+                    quality = q
+                    break
+        
+        if not video_url:
+            await callback_query.answer("❌ Episode link not available", show_alert=True)
+            return
+        
+        # Send download link
+        message_text = (
+            f"**📺 {media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n\n"
+            f"**📁 Size:** {episode.get('size', 'N/A')}\n"
+            f"**🎥 Quality:** {quality.upper()}\n"
+            f"**📝 Episode Title:** {episode.get('title', 'N/A')}\n\n"
+            "**⚠️ LINK EXPIRES IN 10 MINUTES**\n\n"
+            "**Created By:** [Zero Creations](https://t.me/zerocreations)"
+        )
+        
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],
+            [InlineKeyboardButton("⭐ RATE THIS EPISODE", callback_data=f"rate_{media_id}_{season_num}_{episode_num}"),
+             InlineKeyboardButton("🔙 Back", callback_data=f"season_{season_num}_{media_id}")]
+        ])
+        
+        await callback_query.edit_message_text(
+            message_text,
+            reply_markup=buttons
+        )
+        
+        # Auto delete after 10 minutes
+        asyncio.create_task(auto_delete_message(
+            client, 
+            callback_query.message.chat.id, 
+            callback_query.message.id
+        ))
         
         await callback_query.answer()
     
@@ -600,7 +715,115 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.message.delete()
         await callback_query.answer()
     
-    # Other handlers remain the same...
+    elif data.startswith("back_to_quality_"):
+        media_id = int(data.split("_")[3])
+        media = await get_media_by_id(media_id)
+        if media:
+            keyboard = create_quality_buttons(media)
+            await callback_query.edit_message_reply_markup(reply_markup=keyboard)
+        await callback_query.answer()
+    
+    elif data.startswith("back_to_seasons_"):
+        media_id = int(data.split("_")[3])
+        media = await get_media_by_id(media_id)
+        if media:
+            keyboard = create_quality_buttons(media)
+            await callback_query.edit_message_reply_markup(reply_markup=keyboard)
+        await callback_query.answer()
+    
+    elif data in ["top_searches", "help", "bot_stats"]:
+        if data == "top_searches":
+            text = (
+                "**🔝 TOP SEARCHES 🔝**\n\n"
+                "**1. The Matrix**\n"
+                "**2. Breaking Bad**\n"
+                "**3. Inception**\n"
+                "**4. Stranger Things**\n"
+                "**5. Interstellar**\n"
+                "**6. Game of Thrones**\n"
+                "**7. Avengers**\n"
+                "**8. Spider-Man**\n"
+                "**9. The Dark Knight**\n"
+                "**10. Friends**"
+            )
+        elif data == "help":
+            text = (
+                "**📢 HELP - HOW TO USE**\n\n"
+                "**🔍 Search Movies/TV Shows:**\n"
+                "Just type the name of any movie or TV show\n\n"
+                "**🎬 For Movies:**\n"
+                "• Select quality (720p, 1080p, etc.)\n"
+                "• Get direct download link\n\n"
+                "**📺 For TV Shows:**\n"
+                "• Choose season\n"
+                "• Select episode\n"
+                "• Auto quality selection\n\n"
+                "**⚠️ Important:**\n"
+                "• All links expire in 10 minutes\n"
+                "• Save files to your device quickly\n\n"
+                "**Need Premium? Contact:** [Zero Creations](https://t.me/zerocreations)"
+            )
+        else:  # bot_stats
+            total_users = len(user_stats)
+            today = datetime.now().date().isoformat()
+            
+            # Calculate today's activity
+            today_searches = 0
+            today_downloads = 0
+            for stats in user_stats.values():
+                last_seen = datetime.fromisoformat(stats["last_seen"]).date()
+                if last_seen.isoformat() == today:
+                    today_searches += stats.get("search_count", 0)
+                    today_downloads += stats.get("download_count", 0)
+            
+            text = (
+                f"**📊 BOT STATISTICS**\n\n"
+                f"**👥 Total Users:** {total_users}\n"
+                f"**🔍 Today's Searches:** {today_searches}\n"
+                f"**📥 Today's Downloads:** {today_downloads}\n\n"
+                "**Note:** These are aggregated statistics\n"
+                "**Created By:** [Zero Creations](https://t.me/zerocreations)"
+            )
+        
+        await callback_query.answer()
+        await callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
+            ])
+        )
+    
+    elif data == "back_to_start":
+        user_name = callback_query.from_user.first_name or "User"
+        greeting = get_greeting()
+        
+        welcome_message = (
+            f"ʜᴇʏ {user_name}, {greeting}\n\n"
+            "ɪ ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴀᴜᴛᴏ ғɪʟᴛᴇʀ ʙᴏᴛ ᴡɪᴛʜ ᴘʀᴇᴍɪᴜᴍ\n"
+            "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ ᴍᴏᴠɪᴇs ᴊᴜsᴛ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢʀᴏᴜᴘ ᴏʀ sᴇɴᴅ ᴍᴏᴠɪᴇ ɴᴀᴍᴇ ᴀɴᴅ ᴇɴᴊᴏʏ\n\n"
+            "ɴᴇᴇᴅ ᴘʀᴇᴍɪᴜᴍ 👉 /plan"
+        )
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛡️ ADD ME TO YOUR GROUP 🛡️", url=f"https://t.me/FilmziBot?startgroup=true")],
+            [
+                InlineKeyboardButton("TOP SEARCHING ⭐", callback_data="top_searches"),
+                InlineKeyboardButton("HELP 📢", callback_data="help")
+            ],
+            [InlineKeyboardButton("📊 BOT STATS", callback_data="bot_stats")]
+        ])
+        
+        await callback_query.edit_message_text(welcome_message, reply_markup=keyboard)
+        await callback_query.answer()
+    
+    elif data == "noop":
+        await callback_query.answer()
+
+# Background task to keep bot awake
+async def keep_alive():
+    while True:
+        logger.info("Keep alive ping - Bot is active")
+        await asyncio.sleep(300)  # Ping every 5 minutes
 
 # Run the bot
 if __name__ == "__main__":
@@ -613,6 +836,9 @@ if __name__ == "__main__":
     # Start health check server in a separate thread
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
+    
+    # Start keep-alive background task
+    asyncio.create_task(keep_alive())
     
     logger.info("Filmzi Bot is running...")
     app.run()
