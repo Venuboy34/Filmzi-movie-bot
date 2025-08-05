@@ -825,6 +825,11 @@ async def keep_alive():
         logger.info("Keep alive ping - Bot is active")
         await asyncio.sleep(300)  # Ping every 5 minutes
 
+# Start background tasks when bot starts
+@app.on_startup()
+async def startup():
+    asyncio.create_task(keep_alive())
+
 # Run the bot
 if __name__ == "__main__":
     logger.info("Starting Filmzi Bot...")
@@ -836,9 +841,6 @@ if __name__ == "__main__":
     # Start health check server in a separate thread
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
-    
-    # Start keep-alive background task
-    asyncio.create_task(keep_alive())
     
     logger.info("Filmzi Bot is running...")
     app.run()
