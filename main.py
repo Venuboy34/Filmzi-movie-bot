@@ -4,6 +4,8 @@ import asyncio
 import threading
 import json
 import logging
+import aiohttp
+import aiofiles
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters
@@ -16,6 +18,8 @@ from pyrogram.types import (
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired
 import requests
 from typing import Dict, List, Union
+import tempfile
+import urllib.parse
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +50,238 @@ app = Client("Filmzi", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 # User data cache (for pagination and state management)
 user_data = {}
 user_stats = {}
+start_time = datetime.now()
+
+# File download session
+download_session = None
+
+async def init_download_session():
+    """Initialize aiohttp session for downloads"""
+    global download_session
+    if download_session is None:
+        timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour timeout
+        download_session = aiohttp.ClientSession(
+            timeout=timeout,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        )
+
+async def close_download_session():
+    """Close aiohttp session"""
+    global download_session
+    if download_session:
+        await download_session.close()
+        download_session = None
+
+def get_filename_from_url(url: str, title: str = "video") -> str:
+    """Extract filename from URL or create one"""
+    try:
+        # Try to get filename from URL
+        parsed_url = urllib.parse.urlparse(url)
+        filename = os.path.basename(parsed_url.path)
+        
+        # If no filename in URL, create one from title
+        if not filename or '.' not in filename:
+            # Clean title for filename
+            clean_title = re.sub(r'[^\w\s-]', '', title)
+            clean_title = re.sub(r'[-\s]+', '_', clean_title)
+            filename = f"{clean_title}.mp4"
+        
+        return filename
+    except:
+        return f"{title}.mp4"
+
+async def download_and_send_file(client: Client, chat_id: int, url: str, title: str, quality: str = "", file_size: str = ""):
+    """Download file from URL and send to user"""
+    try:
+        await init_download_session()
+        
+        # Send initial message
+        status_msg = await client.send_message(
+            chat_id=chat_id,
+            text=f"📥 **Downloading {title}**\n\n⏳ Please wait, this may take a few minutes..."
+        )
+        
+        filename = get_filename_from_url(url, title)
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+            temp_path = temp_file.name
+            
+            # Download file with progress tracking
+            async with download_session.get(url) as response:
+                if response.status != 200:
+                    raise Exception(f"HTTP {response.status}: Unable to download file")
+                
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                chunk_size = 8192 * 16  # 128KB chunks for faster download
+                
+                last_progress_update = 0
+                
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    temp_file.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    # Update progress every 5MB or 10% (whichever is smaller)
+                    if total_size > 0:
+                        progress = (downloaded / total_size) * 100
+                        if progress - last_progress_update >= 10:  # Update every 10%
+                            try:
+                                await status_msg.edit_text(
+                                    f"📥 **Downloading {title}**\n\n"
+                                    f"📊 Progress: {progress:.1f}%\n"
+                                    f"📦 Downloaded: {downloaded // (1024*1024)} MB"
+                                    f"{f' / {total_size // (1024*1024)} MB' if total_size > 0 else ''}"
+                                )
+                                last_progress_update = progress
+                            except:
+                                pass  # Ignore edit errors
+        
+        # Update status to uploading
+        try:
+            await status_msg.edit_text(
+                f"📤 **Uploading {title}**\n\n⬆️ Preparing to send file..."
+            )
+        except:
+            pass
+        
+        # Prepare caption
+        caption = f"🎬 **{title}**"
+        if quality:
+            caption += f" - **{quality.upper()}**"
+        if file_size:
+            caption += f"\n📁 **Size:** {file_size}"
+        
+        caption += f"\n\n⚡ **Fast Download Complete**\n"
+        caption += f"📱 **File:** {filename}\n\n"
+        caption += "**Created By:** [Zero Creations](https://t.me/zerocreations)"
+        
+        # Send file as document
+        try:
+            sent_msg = await client.send_document(
+                chat_id=chat_id,
+                document=temp_path,
+                file_name=filename,
+                caption=caption,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⭐ Rate This", callback_data=f"rate_{title[:20]}")]
+                ])
+            )
+            
+            # Delete status message
+            try:
+                await status_msg.delete()
+            except:
+                pass
+            
+            # Schedule file deletion after 30 minutes
+            asyncio.create_task(auto_delete_message(client, chat_id, sent_msg.id, 1800))
+            
+        except Exception as e:
+            logger.error(f"Error sending document: {e}")
+            # If document send fails, try as video
+            try:
+                sent_msg = await client.send_video(
+                    chat_id=chat_id,
+                    video=temp_path,
+                    file_name=filename,
+                    caption=caption,
+                    supports_streaming=True,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⭐ Rate This", callback_data=f"rate_{title[:20]}")]
+                    ])
+                )
+                
+                # Delete status message
+                try:
+                    await status_msg.delete()
+                except:
+                    pass
+                
+                # Schedule file deletion after 30 minutes
+                asyncio.create_task(auto_delete_message(client, chat_id, sent_msg.id, 1800))
+                
+            except Exception as video_error:
+                logger.error(f"Error sending video: {video_error}")
+                # Final fallback - send download link
+                await status_msg.edit_text(
+                    f"❌ **Upload Failed**\n\n"
+                    f"**File was downloaded but couldn't be uploaded to Telegram.**\n"
+                    f"**This might be due to file size limits.**\n\n"
+                    f"**Direct Download Link:**\n{url}\n\n"
+                    "**Note:** Link may expire soon, download quickly!",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔗 Direct Download", url=url)]
+                    ])
+                )
+        
+        # Clean up temporary file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        try:
+            await status_msg.edit_text(
+                f"❌ **Download Failed**\n\n"
+                f"**Error:** {str(e)}\n\n"
+                f"**Try the direct link instead:**",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Direct Download", url=url)]
+                ])
+            )
+        except:
+            await client.send_message(
+                chat_id=chat_id,
+                text=f"❌ **Download Failed**\n\n**Error:** {str(e)}\n\n**Direct Link:** {url}"
+            )
+
+def is_streamable_url(url: str) -> bool:
+    """Check if URL is likely to be streamable/downloadable"""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # Known file hosting services
+        streamable_domains = [
+            'pixeldrain.com',
+            'pixeldrain.dev',
+            'drive.google.com',
+            'dropbox.com',
+            'mediafire.com',
+            'mega.nz',
+            'wetransfer.com',
+            'sendspace.com',
+            'zippyshare.com',
+            'rapidgator.net',
+            'uploaded.net',
+            'file.io',
+            'gofile.io',
+            '1fichier.com',
+            'uptobox.com',
+            'nitroflare.com',
+        ]
+        
+        # Check if it's a direct file URL (has file extension)
+        file_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ts']
+        if any(url.lower().endswith(ext) for ext in file_extensions):
+            return True
+            
+        # Check known domains
+        if any(domain in streamable_domain for streamable_domain in streamable_domains):
+            return True
+            
+        # Check for download parameter
+        if 'download' in parsed.query.lower():
+            return True
+            
+        return False
+    except:
+        return False
 
 # Load statistics
 def load_stats():
@@ -76,7 +312,7 @@ def track_user(user_id: int, action: str):
                 "search_count": 0,
                 "download_count": 0
             }
-        
+
         user_stats[user_id]["last_seen"] = datetime.now().isoformat()
         
         if action == "search":
@@ -110,7 +346,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def log_message(self, format, *args):
         # Suppress HTTP server logs
         pass
@@ -155,19 +391,19 @@ async def get_media_by_id(media_id: int) -> Union[Dict, None]:
         return None
 
 def create_media_message(media: Dict) -> str:
-    message = f"**🎬 {media.get('title', 'N/A')}**\n\n"
-    message += f"**📅 Release Date:** {media.get('release_date', 'N/A')}\n"
-    message += f"**🌐 Language:** {media.get('language', 'N/A').upper()}\n"
-    message += f"**⭐ Rating:** {media.get('rating', 'N/A')}\n"
-    message += f"**⏱️ Duration:** {media.get('duration', 'N/A')}\n\n"
-    message += f"**📝 Description:** {media.get('description', 'No description available.')}\n\n"
-    message += "**Powered By:** Filmzi 🎥\n"
-    message += "**Created By:** [Zero Creations](https://t.me/zerocreations)"
+    message = f"🎬 {media.get('title', 'N/A')}\n\n"
+    message += f"📅 Release Date: {media.get('release_date', 'N/A')}\n"
+    message += f"🌐 Language: {media.get('language', 'N/A').upper()}\n"
+    message += f"⭐ Rating: {media.get('rating', 'N/A')}\n"
+    message += f"⏱️ Duration: {media.get('duration', 'N/A')}\n\n"
+    message += f"📝 Description: {media.get('description', 'No description available.')}\n\n"
+    message += "Powered By: Filmzi 🎥\n"
+    message += "Created By: Zero Creations"
     return message
 
 def create_quality_buttons(media: Dict) -> InlineKeyboardMarkup:
     buttons = []
-    
+
     if media["type"] == "movie":
         video_links = media.get("video_links", {})
         if "1080p" in video_links:
@@ -199,7 +435,7 @@ def filter_media_by_query(all_media: List[Dict], query: str) -> List[Dict]:
     query = query.lower().strip()
     if not query:
         return all_media
-    
+
     filtered = []
     query_words = query.split()
     
@@ -257,7 +493,7 @@ async def start_command(client: Client, message: Message):
     track_user(user_id, "search")
     user_name = message.from_user.first_name or "User"
     greeting = get_greeting()
-    
+
     # Check if user is member of movie group
     is_member = await check_user_membership(client, user_id)
     
@@ -312,14 +548,14 @@ async def plan_command(client: Client, message: Message):
     is_member = await check_user_membership(client, message.from_user.id)
     if not is_member:
         await message.reply_text(
-            "**❌ Please join our movie updates group first to use the bot!**",
+            "❌ Please join our movie updates group first to use the bot!",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎬 JOIN GROUP", url=MOVIE_GROUP_LINK)],
                 [InlineKeyboardButton("✅ CHECK MEMBERSHIP", callback_data="check_membership")]
             ])
         )
         return
-    
+
     track_user(message.from_user.id, "search")
     plan_message = (
         "**💎 PREMIUM PLANS 💎**\n\n"
@@ -350,15 +586,18 @@ async def plan_command(client: Client, message: Message):
 async def stats_command(client: Client, message: Message):
     total_users = len(user_stats)
     today = datetime.now().date().isoformat()
-    
+
     # Calculate today's activity
     today_searches = 0
     today_downloads = 0
     for stats in user_stats.values():
-        last_seen = datetime.fromisoformat(stats["last_seen"]).date()
-        if last_seen.isoformat() == today:
-            today_searches += stats.get("search_count", 0)
-            today_downloads += stats.get("download_count", 0)
+        try:
+            last_seen = datetime.fromisoformat(stats["last_seen"]).date()
+            if last_seen.isoformat() == today:
+                today_searches += stats.get("search_count", 0)
+                today_downloads += stats.get("download_count", 0)
+        except:
+            continue
     
     stats_message = (
         f"**📊 BOT STATISTICS**\n\n"
@@ -375,7 +614,7 @@ async def stats_command(client: Client, message: Message):
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "plan", "stats"]))
 async def auto_filter(client: Client, message: Message):
     user_id = message.from_user.id
-    
+
     # Check membership first
     is_member = await check_user_membership(client, user_id)
     if not is_member:
@@ -440,7 +679,7 @@ async def auto_filter(client: Client, message: Message):
 async def display_result_page(client: Client, user_id: int, message_id: int, page: int, chat_id: int = None):
     if user_id not in user_data:
         return
-    
+
     results = user_data[user_id]["results"]
     total_pages = len(results)
     query = user_data[user_id]["query"]
@@ -523,7 +762,7 @@ async def display_result_page(client: Client, user_id: int, message_id: int, pag
 async def handle_callback_query(client: Client, callback_query: CallbackQuery):
     data = callback_query.data
     user_id = callback_query.from_user.id
-    
+
     # Check membership for most actions (except check_membership itself)
     if data != "check_membership":
         is_member = await check_user_membership(client, user_id)
@@ -608,32 +847,21 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("❌ Download link not available", show_alert=True)
             return
         
-        # Send video file directly
-        try:
-            # Try to send as document first
-            sent_msg = await client.send_document(
-                chat_id=callback_query.from_user.id,
-                document=video_url,
-                caption=f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"
-                        f"**📁 Size:** {media.get('size', 'N/A')}\n"
-                        f"**🎥 Quality:** {quality.upper()}\n\n"
-                        "**⚠️ This file will be deleted in 10 minutes**\n\n"
-                        "**Created By:** [Zero Creations](https://t.me/zerocreations)",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],
-                    [InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}")]
-                ])
-            )
+        # Check if URL is streamable and send directly
+        if is_streamable_url(video_url):
+            await callback_query.answer("📥 Starting download...", show_alert=True)
             
-            # Auto delete after 10 minutes
-            asyncio.create_task(auto_delete_message(
-                client, 
-                callback_query.from_user.id, 
-                sent_msg.id
+            # Start download and send task
+            asyncio.create_task(download_and_send_file(
+                client,
+                user_id,
+                video_url,
+                media.get('title', 'Movie'),
+                quality,
+                media.get('size', '')
             ))
             
-        except Exception as e:
-            logger.error(f"Error sending document: {e}")
+        else:
             # Fallback to download link message
             message_text = (
                 f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"
@@ -706,7 +934,7 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
         
         episode = next(
             (ep for ep in media["seasons"][season_key]["episodes"] 
-            if str(ep["episode_number"]) == episode_num),
+             if str(ep["episode_number"]) == episode_num),
             None
         )
         
@@ -740,32 +968,25 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("❌ Episode link not available", show_alert=True)
             return
         
-        # Send video file directly for episodes
-        try:
-            # Try to send as document first
-            sent_msg = await client.send_document(
-                chat_id=callback_query.from_user.id,
-                document=video_url,
-                caption=f"**📺 {media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n"
-                        f"**🎥 Quality:** {quality.upper()}\n"
-                        f"**📝 Episode Title:** {episode.get('title', 'N/A')}\n\n"
-                        "**⚠️ This file will be deleted in 10 minutes**\n\n"
-                        "**Created By:** [Zero Creations](https://t.me/zerocreations)",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],
-                    [InlineKeyboardButton("⭐ RATE THIS EPISODE", callback_data=f"rate_{media_id}_{season_num}_{episode_num}")]
-                ])
-            )
+        # Check if URL is streamable and send directly
+        if is_streamable_url(video_url):
+            await callback_query.answer("📥 Starting download...", show_alert=True)
             
-            # Auto delete after 10 minutes
-            asyncio.create_task(auto_delete_message(
-                client, 
-                callback_query.from_user.id, 
-                sent_msg.id
+            episode_title = f"{media.get('title', 'Series')} S{season_num}E{episode_num}"
+            if episode.get('title'):
+                episode_title += f" - {episode['title']}"
+            
+            # Start download and send task
+            asyncio.create_task(download_and_send_file(
+                client,
+                user_id,
+                video_url,
+                episode_title,
+                quality,
+                episode.get('size', '')
             ))
             
-        except Exception as e:
-            logger.error(f"Error sending document: {e}")
+        else:
             # Fallback to download link message
             message_text = (
                 f"**📺 {media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n\n"
@@ -847,14 +1068,14 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
                 "**🎬 For Movies:**\n"
                 "• Browse through search results\n"
                 "• Select quality (480p, 720p, 1080p)\n"
-                "• Get direct download link\n\n"
+                "• Get direct file or download link\n\n"
                 "**📺 For TV Shows:**\n"
                 "• Choose season\n"
                 "• Select episode\n"
                 "• Auto quality selection\n\n"
                 "**⚠️ Important Notes:**\n"
                 "• Must join movie updates group\n"
-                "• All links expire in 10 minutes\n"
+                "• Files auto-delete in 30 minutes\n"
                 "• Save files to your device quickly\n"
                 "• Bot works in groups too!\n\n"
                 "**🎥 Movie Updates:** [Join Group](https://t.me/filmzi2)\n"
@@ -934,7 +1155,7 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
 async def group_auto_filter(client: Client, message: Message):
     # Only respond if bot is mentioned or message is a reply to bot
     bot_mentioned = False
-    
+
     # Check if bot is mentioned
     if message.entities:
         for entity in message.entities:
@@ -1011,7 +1232,7 @@ async def group_auto_filter(client: Client, message: Message):
 @app.on_message(filters.command("start") & filters.regex(r"movie_\d+"))
 async def handle_deep_link(client: Client, message: Message):
     user_id = message.from_user.id
-    
+
     # Check membership first
     is_member = await check_user_membership(client, user_id)
     if not is_member:
@@ -1085,13 +1306,17 @@ def get_memory_usage():
 if __name__ == "__main__":
     logger.info("Starting Filmzi Bot...")
     start_time = datetime.now()
-    
+
     # Load statistics
     load_stats()
     
     # Start health check server in a separate thread
     health_thread = threading.Thread(target=start_health_server, daemon=True)
     health_thread.start()
+    
+    # Set up cleanup on exit
+    import atexit
+    atexit.register(lambda: asyncio.run(close_download_session()) if download_session else None)
     
     logger.info("Filmzi Bot is running...")
     app.run()
