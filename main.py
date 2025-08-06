@@ -35,6 +35,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID', 0))  # Your Telegram user ID
 # Movie update group (users must join this)
 MOVIE_GROUP_ID = "@filmzi2"  # Your group username
 MOVIE_GROUP_LINK = "https://t.me/filmzi2"
+UPDATES_CHANNEL = "@BZWCinema"  # New channel for updates
 
 # API configuration
 MEDIA_ENDPOINT = "/media"
@@ -608,75 +609,63 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("❌ Download link not available", show_alert=True)  
             return  
           
-        # Send video file directly  
-        try:  
-            # Check if it's a direct video URL (pixeldrain or similar)
-            if "pixeldrain" in video_url or any(ext in video_url for ext in [".mp4", ".mkv", ".avi"]):
-                # Send as video file
-                sent_msg = await client.send_video(
-                    chat_id=callback_query.from_user.id,
-                    video=video_url,
-                    caption=f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"
-                            f"**📁 Size:** {media.get('size', 'N/A')}\n"
-                            f"**🎥 Quality:** {quality.upper()}\n\n"
-                            "**⚠️ This video will be deleted in 10 minutes**\n\n"
-                            "**Created By:** [Zero Creations](https://t.me/zerocreations)",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}")
-                    ]])
-                )
-            else:
-                # Send as document for other URL types
-                sent_msg = await client.send_document(  
-                    chat_id=callback_query.from_user.id,  
-                    document=video_url,  
-                    caption=f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"  
-                            f"**📁 Size:** {media.get('size', 'N/A')}\n"  
-                            f"**🎥 Quality:** {quality.upper()}\n\n"  
-                            "**⚠️ This file will be deleted in 10 minutes**\n\n"  
-                            "**Created By:** [Zero Creations](https://t.me/zerocreations)",  
-                    reply_markup=InlineKeyboardMarkup([[  
-                        InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}")  
-                    ]])  
-                )
-              
-            # Auto delete after 10 minutes  
-            asyncio.create_task(auto_delete_message(  
-                client,   
-                callback_query.from_user.id,   
-                sent_msg.id  
-            ))  
-              
-        except Exception as e:  
-            logger.error(f"Error sending media: {e}")  
-            # Fallback to download link message  
-            message_text = (  
-                f"**🎬 {media.get('title', 'N/A')} - {quality.upper()}**\n\n"  
-                f"**📁 Size:** {media.get('size', 'N/A')}\n"  
-                f"**🎥 Quality:** {quality.upper()}\n\n"  
-                "**⚠️ LINK EXPIRES IN 10 MINUTES**\n\n"  
-                "**Created By:** [Zero Creations](https://t.me/zerocreations)"  
-            )  
-              
-            buttons = InlineKeyboardMarkup([  
-                [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],  
-                [InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}"),  
-                 InlineKeyboardButton("🔙 Back", callback_data=f"back_to_quality_{media_id}")]  
-            ])  
-              
-            await callback_query.edit_message_text(  
-                message_text,  
-                reply_markup=buttons  
-            )  
-              
-            # Auto delete after 10 minutes  
-            asyncio.create_task(auto_delete_message(  
-                client,   
-                callback_query.message.chat.id,   
-                callback_query.message.id  
-            ))  
-          
-        await callback_query.answer()  
+        # Create download message with link
+        size = media.get('size', 'N/A')
+        file_format = media.get('format', 'N/A')
+        duration = media.get('duration', 'N/A')
+        
+        download_message = (
+            f"# Filmzi Movie Downloader\n\n"
+            f"**{media.get('title', 'N/A')} {quality.upper()}**\n"
+            f"`{size} | {file_format} | {duration}`\n\n"
+            f"**Format:** {media.get('format_details', 'N/A')}\n"
+            f"**Quality:** {quality.upper()}\n\n"
+            f"📌 If you're facing any sound issues, use VLC Media Player\n"
+            f"👉 {UPDATES_CHANNEL}\n\n"
+            f"**Powered By: Filmzi 🎥**\n"
+            f"**Created By: Zero Creations**"
+        )
+        
+        # Create buttons
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 FAST DOWNLOAD / WATCH ONLINE", url=video_url)],
+            [InlineKeyboardButton("✅ JOIN UPDATES CHANNEL", url=f"https://t.me/{UPDATES_CHANNEL[1:]}")],
+            [InlineKeyboardButton("⭐ RATE THIS MOVIE", callback_data=f"rate_{media_id}_{quality}")]
+        ])
+        
+        # Send important note message
+        note_message = (
+            f"**! ! ! IMPORTANT ! ! !**\n\n"
+            f"**THIS DOWNLOAD LINK WILL EXPIRE IN 10 MINUTES**\n"
+            f"(Due to copyright issues)\n\n"
+            f"**PLEASE FORWARD THIS LINK TO YOUR SAVED MESSAGES "
+            f"AND START DOWNLOADING FROM THERE**"
+        )
+        
+        # Send the download message
+        try:
+            sent_msg = await callback_query.message.reply_text(
+                download_message,
+                reply_markup=buttons
+            )
+            
+            # Send the important note
+            note_msg = await callback_query.message.reply_text(
+                note_message,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 DIRECT DOWNLOAD LINK", url=video_url)]
+                ])
+            )
+            
+            # Auto delete after 10 minutes
+            asyncio.create_task(auto_delete_message(client, callback_query.message.chat.id, sent_msg.id))
+            asyncio.create_task(auto_delete_message(client, callback_query.message.chat.id, note_msg.id))
+            
+        except Exception as e:
+            logger.error(f"Error sending download message: {e}")
+            await callback_query.answer("❌ Failed to generate download link", show_alert=True)
+        
+        await callback_query.answer()
       
     elif data.startswith("season_"):  
         season_num = data.split("_")[1]  
@@ -755,76 +744,63 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             await callback_query.answer("❌ Episode link not available", show_alert=True)  
             return  
           
-        # Send video file directly for episodes  
-        try:  
-            # Check if it's a direct video URL (pixeldrain or similar)
-            if "pixeldrain" in video_url or any(ext in video_url for ext in [".mp4", ".mkv", ".avi"]):
-                # Send as video file
-                sent_msg = await client.send_video(
-                    chat_id=callback_query.from_user.id,
-                    video=video_url,
-                    caption=f"**📺 {media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n"
-                            f"**🎥 Quality:** {quality.upper()}\n"
-                            f"**📝 Episode Title:** {episode.get('title', 'N/A')}\n\n"
-                            "**⚠️ This video will be deleted in 10 minutes**\n\n"
-                            "**Created By:** [Zero Creations](https://t.me/zerocreations)",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⭐ RATE THIS EPISODE", callback_data=f"rate_{media_id}_{season_num}_{episode_num}")
-                    ]])
-                )
-            else:
-                # Send as document for other URL types
-                sent_msg = await client.send_document(  
-                    chat_id=callback_query.from_user.id,  
-                    document=video_url,  
-                    caption=f"**📺 {media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n"  
-                            f"**🎥 Quality:** {quality.upper()}\n"  
-                            f"**📝 Episode Title:** {episode.get('title', 'N/A')}\n\n"  
-                            "**⚠️ This file will be deleted in 10 minutes**\n\n"  
-                            "**Created By:** [Zero Creations](https://t.me/zerocreations)",  
-                    reply_markup=InlineKeyboardMarkup([[  
-                        InlineKeyboardButton("⭐ RATE THIS EPISODE", callback_data=f"rate_{media_id}_{season_num}_{episode_num}")  
-                    ]])  
-                )
-              
-            # Auto delete after 10 minutes  
-            asyncio.create_task(auto_delete_message(  
-                client,   
-                callback_query.from_user.id,   
-                sent_msg.id  
-            ))  
-              
-        except Exception as e:  
-            logger.error(f"Error sending episode: {e}")  
-            # Fallback to download link message  
-            message_text = (  
-                f"**📺 {media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n\n"  
-                f"**📁 Size:** {episode.get('size', 'N/A')}\n"  
-                f"**🎥 Quality:** {quality.upper()}\n"  
-                f"**📝 Episode Title:** {episode.get('title', 'N/A')}\n\n"  
-                "**⚠️ LINK EXPIRES IN 10 MINUTES**\n\n"  
-                "**Created By:** [Zero Creations](https://t.me/zerocreations)"  
-            )  
-              
-            buttons = InlineKeyboardMarkup([  
-                [InlineKeyboardButton("🚀 FAST DOWNLOAD", url=video_url)],  
-                [InlineKeyboardButton("⭐ RATE THIS EPISODE", callback_data=f"rate_{media_id}_{season_num}_{episode_num}"),  
-                 InlineKeyboardButton("🔙 Back", callback_data=f"season_{season_num}_{media_id}")]  
-            ])  
-              
-            await callback_query.edit_message_text(  
-                message_text,  
-                reply_markup=buttons  
-            )  
-              
-            # Auto delete after 10 minutes  
-            asyncio.create_task(auto_delete_message(  
-                client,   
-                callback_query.message.chat.id,   
-                callback_query.message.id  
-            ))  
-          
-        await callback_query.answer()  
+        # Create download message for episode
+        size = episode.get('size', 'N/A')
+        file_format = episode.get('format', 'N/A')
+        duration = episode.get('duration', 'N/A')
+        
+        download_message = (
+            f"# Filmzi TV Downloader\n\n"
+            f"**{media.get('title', 'N/A')} - S{season_num}E{episode_num}**\n"
+            f"`{size} | {file_format} | {duration}`\n\n"
+            f"**Episode Title:** {episode.get('title', 'N/A')}\n"
+            f"**Quality:** {quality.upper()}\n\n"
+            f"📌 If you're facing any sound issues, use VLC Media Player\n"
+            f"👉 {UPDATES_CHANNEL}\n\n"
+            f"**Powered By: Filmzi 🎥**\n"
+            f"**Created By: Zero Creations**"
+        )
+        
+        # Create buttons
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 FAST DOWNLOAD / WATCH ONLINE", url=video_url)],
+            [InlineKeyboardButton("✅ JOIN UPDATES CHANNEL", url=f"https://t.me/{UPDATES_CHANNEL[1:]}")],
+            [InlineKeyboardButton("⭐ RATE THIS EPISODE", callback_data=f"rate_{media_id}_{season_num}_{episode_num}")]
+        ])
+        
+        # Send important note message
+        note_message = (
+            f"**! ! ! IMPORTANT ! ! !**\n\n"
+            f"**THIS DOWNLOAD LINK WILL EXPIRE IN 10 MINUTES**\n"
+            f"(Due to copyright issues)\n\n"
+            f"**PLEASE FORWARD THIS LINK TO YOUR SAVED MESSAGES "
+            f"AND START DOWNLOADING FROM THERE**"
+        )
+        
+        # Send the download message
+        try:
+            sent_msg = await callback_query.message.reply_text(
+                download_message,
+                reply_markup=buttons
+            )
+            
+            # Send the important note
+            note_msg = await callback_query.message.reply_text(
+                note_message,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 DIRECT DOWNLOAD LINK", url=video_url)]
+                ])
+            )
+            
+            # Auto delete after 10 minutes
+            asyncio.create_task(auto_delete_message(client, callback_query.message.chat.id, sent_msg.id))
+            asyncio.create_task(auto_delete_message(client, callback_query.message.chat.id, note_msg.id))
+            
+        except Exception as e:
+            logger.error(f"Error sending episode download: {e}")
+            await callback_query.answer("❌ Failed to generate download link", show_alert=True)
+        
+        await callback_query.answer()
       
     elif data.startswith("back_to_"):  
         if data == "back_to_search":  
